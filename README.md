@@ -155,8 +155,6 @@ For multiple cameras, create a DHCP reservation for each camera in your router. 
 
 The installer:
 
-- hides the Wi-Fi password while you type;
-- asks for it twice;
 - stores the temporary credentials on the SD card during installation;
 - persists the working `wpa_supplicant` configuration to the camera's CONFIG partition;
 - does **not** intentionally upload your Wi-Fi credentials anywhere.
