@@ -41,38 +41,6 @@ It walks you through the complete process using numbered choices and plain-Engli
 9. ⚡ **Flash + read-back verify every 4 KiB block** of the APP partition.
 10. ✅ **Check the final RTSP service** and display the stream URL.
 
-A typo or wrong menu choice does **not** terminate the installer. It simply asks again.
-
----
-
-## 🖥️ Example
-
-```text
-╔══════════════════════════════════════════════════════════════╗
-║              LSC 3215672.2 DECLOUD WIZARD                  ║
-║              Tuya cloud  ➜  Local RTSP                     ║
-╚══════════════════════════════════════════════════════════════╝
-Beginner-friendly installer for the Action LSC Smart Connect camera
-Anyka AK3918AV130 • ak_rtsp • Linux
-
-Version 0.2.0
-
-────────────────────────────────────────────────────────────
-[1/8] Camera identification
-────────────────────────────────────────────────────────────
-
-? Camera name: Front Door
-✔ Camera name saved as 'front-door'.
-
-────────────────────────────────────────────────────────────
-[3/8] Wi-Fi setup
-────────────────────────────────────────────────────────────
-
-? Wi-Fi SSID: MyWiFi
-? Wi-Fi password: ********
-? Wi-Fi password again: ********
-✔ Wi-Fi password confirmed.
-```
 
 ---
 
