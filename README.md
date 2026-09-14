@@ -226,8 +226,8 @@ Make sure the SD card prepared by the wizard is still inserted during the flashi
 Instead of the one-line installer:
 
 ```bash
-git clone https://github.com/4ddict/LSC-3215672-Decloud-Wizard.git
-cd LSC-3215672-Decloud-Wizard
+git clone https://github.com/4ddict/Action-Smart-Connect-Flasher.git
+cd Action-Smart-Connect-Flasher
 chmod +x install.sh
 ./install.sh
 ```
