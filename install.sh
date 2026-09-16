@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -283,6 +283,7 @@ update_sources() {
         "$SRC_DIR/firmware/src/ak_rtsp/Makefile"
         "$SRC_DIR/firmware/src/ak_rtsp/build_firmware.sh"
         "$SRC_DIR/firmware/src/ak_rtsp/arm_atomics.S"
+        "$SRC_DIR/firmware/src/ak_rtsp/ae.c"
         "$SRC_DIR/firmware/tools/firmware_patch_templates/ak_rtsp_wrapper.sh"
     )
     for f in "${required[@]}"; do [[ -f "$f" ]] || die "Upstream layout changed; missing: $f"; done
@@ -633,6 +634,20 @@ EOF2
 EOF_VERSION
     chmod +x "$akdir/gen_version.sh"
     sed -i 's|pwsh -NoProfile -NonInteractive -File gen_version.ps1|./gen_version.sh|' "$akdir/Makefile"
+
+    # GC20C3 exposure fix.
+    # The stock ISP configuration uses AE pub[1]=2. Upstream ak_rtsp currently
+    # sets the corresponding tuning value to 1039, which prevents auto-exposure
+    # from reducing the sensor exposure far enough in bright scenes.
+    local ae="$akdir/ae.c"
+    if grep -Eq '\.exp_max[[:space:]]*=[[:space:]]*1039([[:space:]]*,)?' "$ae"; then
+        sed -i -E '/\.exp_max[[:space:]]*=[[:space:]]*1039/ s/1039/2/' "$ae"
+        ok "Applied GC20C3 exposure fix: ae.exp_max 1039 -> 2."
+    elif grep -Eq '\.exp_max[[:space:]]*=[[:space:]]*2([[:space:]]*,)?' "$ae"; then
+        ok "GC20C3 exposure fix is already present."
+    else
+        die "Upstream ae.c changed; refusing to patch GC20C3 exposure blindly."
+    fi
 
     # Give each camera a useful DHCP hostname (for example front-door).
     # CAMERA_HOSTNAME is strictly sanitized by ask_camera_name().
