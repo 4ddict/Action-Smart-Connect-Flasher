@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.5"
+VERSION="0.2.6"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -660,10 +660,6 @@ import sys
 path = Path(sys.argv[1])
 src = path.read_text()
 
-if "g_mode_generation" in src and "night_get_snapshot" in src:
-    print("already-patched")
-    raise SystemExit(0)
-
 def sub_once(pattern, replacement, label, flags=0):
     global src
     rx = re.compile(pattern, flags)
@@ -675,20 +671,22 @@ def sub_once(pattern, replacement, label, flags=0):
         )
     src = rx.sub(lambda m: m.expand(replacement), src, count=1)
 
-sub_once(
-    r'(?m)^(static volatile int g_is_night\s*=\s*0;[^\n]*\n)',
-    '''/* control.c updates g_tuning from a different pthread than night_loop().
+# Synchronize the tuning snapshot shared between control.c and night_loop().
+if "g_mode_generation" not in src or "night_get_snapshot" not in src:
+    sub_once(
+        r'(?m)^(static volatile int g_is_night\s*=\s*0;[^\n]*\n)',
+        '''/* control.c updates g_tuning from a different pthread than night_loop().
  * Protect the multi-field tuning snapshot and use a generation counter so a
  * manual DAY/NIGHT/AUTO change invalidates stale debounce/lock state. */
 static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned        g_mode_generation = 0;
 \\1''',
-    "g_is_night declaration",
-)
+        "g_is_night declaration",
+    )
 
-sub_once(
-    r'(?m)^void\s+night_get_tuning\s*\(\s*night_tuning_t\s*\*out\s*\)\s*\{\s*\*out\s*=\s*g_tuning;\s*\}\s*$',
-    '''static unsigned night_get_snapshot(night_tuning_t *out)
+    sub_once(
+        r'(?m)^void\s+night_get_tuning\s*\(\s*night_tuning_t\s*\*out\s*\)\s*\{\s*\*out\s*=\s*g_tuning;\s*\}\s*$',
+        '''static unsigned night_get_snapshot(night_tuning_t *out)
 {
     unsigned generation;
     pthread_mutex_lock(&g_night_lock);
@@ -702,12 +700,12 @@ void night_get_tuning(night_tuning_t *out)
 {
     (void)night_get_snapshot(out);
 }''',
-    "night_get_tuning()",
-)
+        "night_get_tuning()",
+    )
 
-sub_once(
-    r'(?m)^void\s+night_set_tuning\s*\(\s*const\s+night_tuning_t\s*\*in\s*\)\s*\{\s*g_tuning\s*=\s*\*in;\s*\}\s*$',
-    '''void night_set_tuning(const night_tuning_t *in)
+    sub_once(
+        r'(?m)^void\s+night_set_tuning\s*\(\s*const\s+night_tuning_t\s*\*in\s*\)\s*\{\s*g_tuning\s*=\s*\*in;\s*\}\s*$',
+        '''void night_set_tuning(const night_tuning_t *in)
 {
     pthread_mutex_lock(&g_night_lock);
     if (g_tuning.override != in->override)
@@ -715,49 +713,139 @@ sub_once(
     g_tuning = *in;
     pthread_mutex_unlock(&g_night_lock);
 }''',
-    "night_set_tuning()",
-)
+        "night_set_tuning()",
+    )
 
-if not re.search(
-    r'(?m)^int\s+night_is_night\s*\(\s*void\s*\)\s*\{\s*return\s+g_is_night;\s*\}\s*$',
-    src,
-):
-    raise SystemExit("ERROR: upstream night.c night_is_night() changed; refusing to patch blindly")
-
-sub_once(
-    r'(?m)^([ \t]*)long long lock_until\s*=\s*0;\s*$',
-    r'''\1long long lock_until           = 0;
-\1unsigned  seen_mode_generation = 0;
-\1int       have_mode_generation = 0;''',
-    "night_loop lock locals",
+loop_pattern = re.compile(
+    r'static void \*night_loop\(void \*arg\)\n\{.*?\n\}\n(?=int night_start\(void\))',
+    re.S,
 )
+matches = list(loop_pattern.finditer(src))
+if len(matches) != 1:
+    raise SystemExit(
+        f"ERROR: upstream night.c night_loop() layout changed "
+        f"(matched {len(matches)} times); refusing to patch blindly"
+    )
 
-sub_once(
-    r'(?m)^([ \t]*)night_get_tuning\(&t\);\s*$',
-    r'''\1unsigned mode_generation = night_get_snapshot(&t);
-\1if (!have_mode_generation) {
-\1    seen_mode_generation = mode_generation;
-\1    have_mode_generation = 1;
-\1} else if (mode_generation != seen_mode_generation) {
-\1    seen_mode_generation = mode_generation;
-\1    confirm = 0;
-\1    lock_until = 0;
-\1    printf("[night] mode changed -> reset confirm/lock\\n");
-\1}''',
-    "night_loop tuning snapshot",
-)
+new_loop = r'''static void *night_loop(void *arg)
+{
+    (void)arg;
+    int       confirm              = 0;
+    long long last_switch_ms       = 0;
+    unsigned  seen_mode_generation = 0;
+    int       have_mode_generation = 0;
+
+    printf("[night] auto day/night monitor started (poll=%dms)\n", POLL_US / 1000);
+
+    while (g_night_running) {
+        usleep(POLL_US);
+
+        night_tuning_t t;
+        unsigned mode_generation = night_get_snapshot(&t);
+
+        /* A manual DAY/NIGHT/AUTO change starts a fresh decision cycle. */
+        if (!have_mode_generation) {
+            seen_mode_generation = mode_generation;
+            have_mode_generation = 1;
+        } else if (mode_generation != seen_mode_generation) {
+            seen_mode_generation = mode_generation;
+            confirm = 0;
+            last_switch_ms = 0;
+            printf("[night] mode changed -> reset confirm/lock\n");
+        }
+
+        /* Manual override always wins. */
+        if (t.override == NIGHT_MODE_FORCE_DAY) {
+            if (g_is_night) {
+                switch_to_day();
+                g_is_night = 0;
+            }
+            confirm = 0;
+            last_switch_ms = 0;
+            continue;
+        }
+
+        if (t.override == NIGHT_MODE_FORCE_NIGHT) {
+            if (!g_is_night) {
+                switch_to_night();
+                g_is_night = 1;
+            }
+            confirm = 0;
+            last_switch_ms = 0;
+            continue;
+        }
+
+        long long now = now_ms();
+
+        /* Relative anti-flap lock using the CURRENT lock_ms value.
+         * This replaces the old absolute lock_until timestamp. */
+        if (last_switch_ms != 0 && t.lock_ms > 0 &&
+            now - last_switch_ms < (long long)t.lock_ms) {
+            confirm = 0;
+            continue;
+        }
+
+        int      lum;
+        uint32_t hw_exp, hw_sgain, hw_isp;
+        if (ae_get_last_stats(&lum, &hw_exp, &hw_sgain, &hw_isp) != 0)
+            continue;
+
+        int desired_night = g_is_night;
+
+        if (g_is_night) {
+            if (hw_exp < t.day_hw_exp)
+                desired_night = 0;
+        } else {
+            if (hw_exp > t.trigger_hw_exp)
+                desired_night = 1;
+        }
+
+        if (desired_night == g_is_night) {
+            confirm = 0;
+            continue;
+        }
+
+        int needed = t.confirm_samples > 0 ? t.confirm_samples : 1;
+        if (++confirm < needed)
+            continue;
+
+        if (desired_night)
+            switch_to_night();
+        else
+            switch_to_day();
+
+        g_is_night = desired_night;
+        confirm = 0;
+
+        /* Start the lock only after the potentially slow transition finished. */
+        last_switch_ms = now_ms();
+
+        printf("[night] transition complete -> state=%s lock=%dms\n",
+               g_is_night ? "night" : "day", t.lock_ms);
+    }
+
+    printf("[night] auto day/night monitor stopped\n");
+    return NULL;
+}
+'''
+
+src = loop_pattern.sub(lambda m: new_loop, src, count=1)
 
 required = [
     "static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;",
     "static unsigned        g_mode_generation = 0;",
     "static unsigned night_get_snapshot(night_tuning_t *out)",
-    "if (g_tuning.override != in->override)",
-    "unsigned mode_generation = night_get_snapshot(&t);",
-    "mode changed -> reset confirm/lock",
+    "long long last_switch_ms",
+    "int desired_night = g_is_night;",
+    "last_switch_ms = now_ms();",
+    "transition complete -> state=",
 ]
 missing = [item for item in required if item not in src]
 if missing:
     raise SystemExit("ERROR: day/night patch verification failed: " + ", ".join(missing))
+
+if "lock_until = now + t.lock_ms" in src or "now < lock_until" in src:
+    raise SystemExit("ERROR: old absolute night lock is still present after patch")
 
 path.write_text(src)
 print("patched")
@@ -765,11 +853,16 @@ PY_NIGHT
 
     grep -Fq 'static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;' "$night" \
         || die "Day/night patch verification failed: mutex missing."
-    grep -Fq 'static unsigned        g_mode_generation = 0;' "$night" \
-        || die "Day/night patch verification failed: generation counter missing."
-    grep -Fq 'mode changed -> reset confirm/lock' "$night" \
-        || die "Day/night patch verification failed: reset logic missing."
-    ok "Applied thread-safe day/night override-to-auto recovery fix."
+    grep -Fq 'long long last_switch_ms' "$night" \
+        || die "Day/night patch verification failed: relative lock state missing."
+    grep -Fq 'int desired_night = g_is_night;' "$night" \
+        || die "Day/night patch verification failed: desired-state logic missing."
+    grep -Fq 'transition complete -> state=' "$night" \
+        || die "Day/night patch verification failed: transition-complete logging missing."
+    if grep -Fq 'lock_until = now + t.lock_ms' "$night"; then
+        die "Day/night patch verification failed: old absolute lock still present."
+    fi
+    ok "Applied repeatable day/night auto-transition state-machine fix."
 
     # Give each camera a useful DHCP hostname (for example front-door).
     # CAMERA_HOSTNAME is strictly sanitized by ask_camera_name().
