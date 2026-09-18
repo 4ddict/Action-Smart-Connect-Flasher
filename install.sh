@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.4"
+VERSION="0.2.5"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -654,44 +654,41 @@ EOF_VERSION
     local night="$akdir/night.c"
     python3 - "$night" <<'PY_NIGHT'
 from pathlib import Path
+import re
 import sys
 
 path = Path(sys.argv[1])
 src = path.read_text()
 
-marker = "g_mode_generation"
-if marker in src and "night_get_snapshot" in src:
+if "g_mode_generation" in src and "night_get_snapshot" in src:
     print("already-patched")
     raise SystemExit(0)
 
-old_shared = """static night_tuning_t g_tuning = {
-    .trigger_hw_exp  = NIGHT_TRIGGER_HW_EXP,
-    .day_hw_exp      = DAY_TRIGGER_HW_EXP,
-    .confirm_samples = CONFIRM_SAMPLES,
-    .lock_ms         = LOCK_MS,
-    .override        = NIGHT_MODE_AUTO,
-};
-static volatile int g_is_night = 0;  /* current actual state, boot = day */
-void night_get_tuning(night_tuning_t *out) { *out = g_tuning; }
-void night_set_tuning(const night_tuning_t *in) { g_tuning = *in; }
-int  night_is_night(void) { return g_is_night; }
-"""
+def sub_once(pattern, replacement, label, flags=0):
+    global src
+    rx = re.compile(pattern, flags)
+    matches = list(rx.finditer(src))
+    if len(matches) != 1:
+        raise SystemExit(
+            f"ERROR: upstream night.c {label} changed (matched {len(matches)} times); "
+            "refusing to patch blindly"
+        )
+    src = rx.sub(lambda m: m.expand(replacement), src, count=1)
 
-new_shared = """static night_tuning_t g_tuning = {
-    .trigger_hw_exp  = NIGHT_TRIGGER_HW_EXP,
-    .day_hw_exp      = DAY_TRIGGER_HW_EXP,
-    .confirm_samples = CONFIRM_SAMPLES,
-    .lock_ms         = LOCK_MS,
-    .override        = NIGHT_MODE_AUTO,
-};
-
-/* control.c and night_loop() run on different pthreads. Keep the tuning,
- * mode-generation counter, and published day/night state synchronized. */
+sub_once(
+    r'(?m)^(static volatile int g_is_night\s*=\s*0;[^\n]*\n)',
+    '''/* control.c updates g_tuning from a different pthread than night_loop().
+ * Protect the multi-field tuning snapshot and use a generation counter so a
+ * manual DAY/NIGHT/AUTO change invalidates stale debounce/lock state. */
 static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned        g_mode_generation = 0;
-static int             g_is_night = 0;  /* current actual state, boot = day */
+\\1''',
+    "g_is_night declaration",
+)
 
-static unsigned night_get_snapshot(night_tuning_t *out)
+sub_once(
+    r'(?m)^void\s+night_get_tuning\s*\(\s*night_tuning_t\s*\*out\s*\)\s*\{\s*\*out\s*=\s*g_tuning;\s*\}\s*$',
+    '''static unsigned night_get_snapshot(night_tuning_t *out)
 {
     unsigned generation;
     pthread_mutex_lock(&g_night_lock);
@@ -704,136 +701,63 @@ static unsigned night_get_snapshot(night_tuning_t *out)
 void night_get_tuning(night_tuning_t *out)
 {
     (void)night_get_snapshot(out);
-}
+}''',
+    "night_get_tuning()",
+)
 
-void night_set_tuning(const night_tuning_t *in)
+sub_once(
+    r'(?m)^void\s+night_set_tuning\s*\(\s*const\s+night_tuning_t\s*\*in\s*\)\s*\{\s*g_tuning\s*=\s*\*in;\s*\}\s*$',
+    '''void night_set_tuning(const night_tuning_t *in)
 {
     pthread_mutex_lock(&g_night_lock);
     if (g_tuning.override != in->override)
         ++g_mode_generation;
     g_tuning = *in;
     pthread_mutex_unlock(&g_night_lock);
-}
+}''',
+    "night_set_tuning()",
+)
 
-int night_is_night(void)
-{
-    int state;
-    pthread_mutex_lock(&g_night_lock);
-    state = g_is_night;
-    pthread_mutex_unlock(&g_night_lock);
-    return state;
-}
+if not re.search(
+    r'(?m)^int\s+night_is_night\s*\(\s*void\s*\)\s*\{\s*return\s+g_is_night;\s*\}\s*$',
+    src,
+):
+    raise SystemExit("ERROR: upstream night.c night_is_night() changed; refusing to patch blindly")
 
-static void night_set_state(int state)
-{
-    pthread_mutex_lock(&g_night_lock);
-    g_is_night = state ? 1 : 0;
-    pthread_mutex_unlock(&g_night_lock);
-}
-"""
+sub_once(
+    r'(?m)^([ \t]*)long long lock_until\s*=\s*0;\s*$',
+    r'''\1long long lock_until           = 0;
+\1unsigned  seen_mode_generation = 0;
+\1int       have_mode_generation = 0;''',
+    "night_loop lock locals",
+)
 
-# Current upstream night.c has a two-line explanatory comment immediately
-# before g_tuning. Match the functional block itself, independent of comments.
-if old_shared not in src:
-    raise SystemExit("ERROR: upstream night.c shared-state code changed; refusing to patch blindly")
-if src.count(old_shared) != 1:
-    raise SystemExit("ERROR: upstream night.c shared-state code is ambiguous; refusing to patch blindly")
-src = src.replace(old_shared, new_shared, 1)
+sub_once(
+    r'(?m)^([ \t]*)night_get_tuning\(&t\);\s*$',
+    r'''\1unsigned mode_generation = night_get_snapshot(&t);
+\1if (!have_mode_generation) {
+\1    seen_mode_generation = mode_generation;
+\1    have_mode_generation = 1;
+\1} else if (mode_generation != seen_mode_generation) {
+\1    seen_mode_generation = mode_generation;
+\1    confirm = 0;
+\1    lock_until = 0;
+\1    printf("[night] mode changed -> reset confirm/lock\\n");
+\1}''',
+    "night_loop tuning snapshot",
+)
 
-old_locals = """    int       confirm    = 0;
-    long long lock_until = 0;
-"""
-new_locals = """    int       confirm              = 0;
-    long long lock_until           = 0;
-    unsigned  seen_mode_generation = 0;
-    int       have_mode_generation = 0;
-"""
-if src.count(old_locals) != 1:
-    raise SystemExit("ERROR: upstream night.c loop-local block changed; refusing to patch blindly")
-src = src.replace(old_locals, new_locals, 1)
-
-old_read = """        night_tuning_t t;
-        night_get_tuning(&t);
-        /* Manual override from control.c takes priority over the auto
-         * threshold logic below — applied once per change, then idle. */
-        if (t.override == NIGHT_MODE_FORCE_DAY) {
-            if (g_is_night) { switch_to_day(); g_is_night = 0; confirm = 0; }
-            continue;
-        }
-        if (t.override == NIGHT_MODE_FORCE_NIGHT) {
-            if (!g_is_night) { switch_to_night(); g_is_night = 1; confirm = 0; }
-            continue;
-        }
-"""
-new_read = """        night_tuning_t t;
-        unsigned mode_generation = night_get_snapshot(&t);
-
-        /* A control-thread mode change invalidates any old debounce progress
-         * and any anti-flap lock from the previous mode. This is what makes
-         * FORCE DAY/NIGHT -> AUTO immediately re-evaluate ambient light. */
-        if (!have_mode_generation) {
-            seen_mode_generation = mode_generation;
-            have_mode_generation = 1;
-        } else if (mode_generation != seen_mode_generation) {
-            seen_mode_generation = mode_generation;
-            confirm = 0;
-            lock_until = 0;
-            printf("[night] mode changed -> reset confirm/lock\\n");
-        }
-
-        /* Manual override from control.c takes priority over the auto
-         * threshold logic below — applied once per change, then idle. */
-        if (t.override == NIGHT_MODE_FORCE_DAY) {
-            if (night_is_night()) {
-                switch_to_day();
-                night_set_state(0);
-            }
-            confirm = 0;
-            continue;
-        }
-        if (t.override == NIGHT_MODE_FORCE_NIGHT) {
-            if (!night_is_night()) {
-                switch_to_night();
-                night_set_state(1);
-            }
-            confirm = 0;
-            continue;
-        }
-"""
-if src.count(old_read) != 1:
-    raise SystemExit("ERROR: upstream night.c override block changed; refusing to patch blindly")
-src = src.replace(old_read, new_read, 1)
-
-old_trigger = """        int trigger = g_is_night ? (hw_exp < t.day_hw_exp)
-                                  : (hw_exp > t.trigger_hw_exp);
-        if (trigger) {
-            if (++confirm >= t.confirm_samples) {
-                if (g_is_night) switch_to_day(); else switch_to_night();
-                g_is_night = !g_is_night;
-                confirm    = 0;
-                lock_until = now + t.lock_ms;
-            }
-        } else {
-            confirm = 0;
-        }
-"""
-new_trigger = """        int is_night = night_is_night();
-        int trigger = is_night ? (hw_exp < t.day_hw_exp)
-                               : (hw_exp > t.trigger_hw_exp);
-        if (trigger) {
-            if (++confirm >= t.confirm_samples) {
-                if (is_night) switch_to_day(); else switch_to_night();
-                night_set_state(!is_night);
-                confirm    = 0;
-                lock_until = now + t.lock_ms;
-            }
-        } else {
-            confirm = 0;
-        }
-"""
-if src.count(old_trigger) != 1:
-    raise SystemExit("ERROR: upstream night.c auto-trigger block changed; refusing to patch blindly")
-src = src.replace(old_trigger, new_trigger, 1)
+required = [
+    "static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;",
+    "static unsigned        g_mode_generation = 0;",
+    "static unsigned night_get_snapshot(night_tuning_t *out)",
+    "if (g_tuning.override != in->override)",
+    "unsigned mode_generation = night_get_snapshot(&t);",
+    "mode changed -> reset confirm/lock",
+]
+missing = [item for item in required if item not in src]
+if missing:
+    raise SystemExit("ERROR: day/night patch verification failed: " + ", ".join(missing))
 
 path.write_text(src)
 print("patched")
@@ -843,7 +767,7 @@ PY_NIGHT
         || die "Day/night patch verification failed: mutex missing."
     grep -Fq 'static unsigned        g_mode_generation = 0;' "$night" \
         || die "Day/night patch verification failed: generation counter missing."
-    grep -Fq 'printf("[night] mode changed -> reset confirm/lock\\n");' "$night" \
+    grep -Fq 'mode changed -> reset confirm/lock' "$night" \
         || die "Day/night patch verification failed: reset logic missing."
     ok "Applied thread-safe day/night override-to-auto recovery fix."
 
