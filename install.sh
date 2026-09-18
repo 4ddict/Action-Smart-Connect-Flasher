@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.8"
+VERSION="0.2.9"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -680,22 +680,55 @@ EOF_VERSION
     #   - 1800 switched to NIGHT earlier than desired
     #   - 800 made returning to DAY unnecessarily reluctant
     # Use wider practical hysteresis: NIGHT above 3000, DAY below 1200.
+    #
+    # Upstream keeps explanatory /* ... */ comments on these #define lines,
+    # so patch only the numeric token and deliberately preserve the comments.
     local night="$akdir/night.c"
-    if grep -Eq '^#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+1800([[:space:]]|$)' "$night"; then
-        sed -i -E 's/^(#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+)1800([[:space:]]*)$/\13000\2/' "$night"
-    elif ! grep -Eq '^#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+3000([[:space:]]|$)' "$night"; then
-        die "Upstream NIGHT_TRIGGER_HW_EXP changed; refusing to retune blindly."
-    fi
 
-    if grep -Eq '^#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+800([[:space:]]|$)' "$night"; then
-        sed -i -E 's/^(#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+)800([[:space:]]*)$/\11200\2/' "$night"
-    elif ! grep -Eq '^#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+1200([[:space:]]|$)' "$night"; then
-        die "Upstream DAY_TRIGGER_HW_EXP changed; refusing to retune blindly."
-    fi
+    python3 - "$night" <<'PY_THRESHOLDS'
+from pathlib import Path
+import re
+import sys
 
-    grep -Eq '^#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+3000([[:space:]]|$)' "$night" \
+path = Path(sys.argv[1])
+src = path.read_text()
+
+def retune_macro(name: str, old_value: int, new_value: int):
+    global src
+    rx = re.compile(
+        rf'(?m)^([ \t]*#define[ \t]+{re.escape(name)}[ \t]+)(\d+)([^\n]*)$'
+    )
+    matches = list(rx.finditer(src))
+    if len(matches) != 1:
+        raise SystemExit(
+            f"ERROR: upstream {name} definition changed "
+            f"(matched {len(matches)} times); refusing to retune blindly"
+        )
+
+    current = int(matches[0].group(2))
+    if current == new_value:
+        return
+    if current != old_value:
+        raise SystemExit(
+            f"ERROR: upstream {name} is {current}, expected {old_value}; "
+            "refusing to retune blindly"
+        )
+
+    src = rx.sub(
+        lambda m: f"{m.group(1)}{new_value}{m.group(3)}",
+        src,
+        count=1,
+    )
+
+retune_macro("NIGHT_TRIGGER_HW_EXP", 1800, 3000)
+retune_macro("DAY_TRIGGER_HW_EXP", 800, 1200)
+
+path.write_text(src)
+PY_THRESHOLDS
+
+    grep -Eq '^#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+3000([[:space:]]|/\*|$)' "$night" \
         || die "Night threshold patch verification failed."
-    grep -Eq '^#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+1200([[:space:]]|$)' "$night" \
+    grep -Eq '^#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+1200([[:space:]]|/\*|$)' "$night" \
         || die "Day threshold patch verification failed."
     ok "Applied calibrated day/night thresholds: NIGHT=3000, DAY=1200."
 
