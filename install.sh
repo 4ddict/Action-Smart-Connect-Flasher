@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.2"
+VERSION="0.2.3"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -206,7 +206,7 @@ ask_camera_name() {
 have() { command -v "$1" >/dev/null 2>&1; }
 install_dependencies() {
     local missing=()
-    local cmds=(curl git cmake make zig unsquashfs mksquashfs mkfs.vfat sfdisk lsblk findmnt expect telnet file)
+    local cmds=(curl git cmake make zig python3 unsquashfs mksquashfs mkfs.vfat sfdisk lsblk findmnt expect telnet file)
     for c in "${cmds[@]}"; do have "$c" || missing+=("$c"); done
     if ((${#missing[@]} == 0)); then
         ok "All required tools are installed."
@@ -219,17 +219,17 @@ install_dependencies() {
         quit_cleanly
     fi
     if have pacman; then
-        sudo pacman -S --needed --noconfirm curl git cmake make zig squashfs-tools dosfstools util-linux expect inetutils file
+        sudo pacman -S --needed --noconfirm curl git cmake make zig python squashfs-tools dosfstools util-linux expect inetutils file
     elif have apt-get; then
         sudo apt-get update
         # Package naming differs slightly between Debian/Ubuntu releases.
-        sudo apt-get install -y curl git cmake make squashfs-tools dosfstools util-linux expect telnet file || \
-        sudo apt-get install -y curl git cmake make squashfs-tools dosfstools util-linux expect inetutils-telnet file
+        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux expect telnet file || \
+        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux expect inetutils-telnet file
         if ! have zig; then
             die "Zig is not available from your configured APT repositories. Install Zig, then run this wizard again."
         fi
     elif have dnf; then
-        sudo dnf install -y curl git cmake make zig squashfs-tools dosfstools util-linux expect telnet file
+        sudo dnf install -y curl git cmake make zig python3 squashfs-tools dosfstools util-linux expect telnet file
     else
         die "Unsupported package manager. Install the missing tools manually: ${missing[*]}"
     fi
@@ -262,6 +262,7 @@ update_sources() {
         "$SRC_DIR/firmware/src/ak_rtsp/arm_atomics.S"
         "$SRC_DIR/firmware/src/ak_rtsp/ae.c"
         "$SRC_DIR/firmware/src/ak_rtsp/rtsp.c"
+        "$SRC_DIR/firmware/src/ak_rtsp/night.c"
         "$SRC_DIR/firmware/tools/firmware_patch_templates/ak_rtsp_wrapper.sh"
     )
     for f in "${required[@]}"; do [[ -f "$f" ]] || die "Upstream layout changed; missing: $f"; done
@@ -637,6 +638,210 @@ EOF_VERSION
     else
         ok "RTSP/TCP integrity fix is already present."
     fi
+
+    # Day/night override -> auto recovery fix.
+    #
+    # night.c is read by the auto-monitor thread while control.c can update the
+    # same tuning struct from the control thread. Protect the shared state with
+    # a mutex and track override changes with a generation counter. Whenever the
+    # mode changes (day/night/auto), the auto thread clears its old confirmation
+    # count and anti-flap lock so both:
+    #
+    #   FORCE DAY   -> AUTO in darkness -> NIGHT
+    #   FORCE NIGHT -> AUTO in daylight -> DAY
+    #
+    # are evaluated immediately from fresh AE statistics.
+    local night="$akdir/night.c"
+    python3 - "$night" <<'PY_NIGHT'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+src = path.read_text()
+
+marker = "g_mode_generation"
+if marker in src and "night_get_snapshot" in src:
+    print("already-patched")
+    raise SystemExit(0)
+
+old_shared = """static night_tuning_t g_tuning = {
+    .trigger_hw_exp  = NIGHT_TRIGGER_HW_EXP,
+    .day_hw_exp      = DAY_TRIGGER_HW_EXP,
+    .confirm_samples = CONFIRM_SAMPLES,
+    .lock_ms         = LOCK_MS,
+    .override        = NIGHT_MODE_AUTO,
+};
+static volatile int g_is_night = 0;  /* current actual state, boot = day */
+void night_get_tuning(night_tuning_t *out) { *out = g_tuning; }
+void night_set_tuning(const night_tuning_t *in) { g_tuning = *in; }
+int  night_is_night(void) { return g_is_night; }
+"""
+
+new_shared = """static night_tuning_t g_tuning = {
+    .trigger_hw_exp  = NIGHT_TRIGGER_HW_EXP,
+    .day_hw_exp      = DAY_TRIGGER_HW_EXP,
+    .confirm_samples = CONFIRM_SAMPLES,
+    .lock_ms         = LOCK_MS,
+    .override        = NIGHT_MODE_AUTO,
+};
+
+/* control.c and night_loop() run on different pthreads. Keep the tuning,
+ * mode-generation counter, and published day/night state synchronized. */
+static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned        g_mode_generation = 0;
+static int             g_is_night = 0;  /* current actual state, boot = day */
+
+static unsigned night_get_snapshot(night_tuning_t *out)
+{
+    unsigned generation;
+    pthread_mutex_lock(&g_night_lock);
+    *out = g_tuning;
+    generation = g_mode_generation;
+    pthread_mutex_unlock(&g_night_lock);
+    return generation;
+}
+
+void night_get_tuning(night_tuning_t *out)
+{
+    (void)night_get_snapshot(out);
+}
+
+void night_set_tuning(const night_tuning_t *in)
+{
+    pthread_mutex_lock(&g_night_lock);
+    if (g_tuning.override != in->override)
+        ++g_mode_generation;
+    g_tuning = *in;
+    pthread_mutex_unlock(&g_night_lock);
+}
+
+int night_is_night(void)
+{
+    int state;
+    pthread_mutex_lock(&g_night_lock);
+    state = g_is_night;
+    pthread_mutex_unlock(&g_night_lock);
+    return state;
+}
+
+static void night_set_state(int state)
+{
+    pthread_mutex_lock(&g_night_lock);
+    g_is_night = state ? 1 : 0;
+    pthread_mutex_unlock(&g_night_lock);
+}
+"""
+
+if src.count(old_shared) != 1:
+    raise SystemExit("ERROR: upstream night.c shared-state block changed; refusing to patch blindly")
+src = src.replace(old_shared, new_shared, 1)
+
+old_locals = """    int       confirm    = 0;
+    long long lock_until = 0;
+"""
+new_locals = """    int       confirm              = 0;
+    long long lock_until           = 0;
+    unsigned  seen_mode_generation = 0;
+    int       have_mode_generation = 0;
+"""
+if src.count(old_locals) != 1:
+    raise SystemExit("ERROR: upstream night.c loop-local block changed; refusing to patch blindly")
+src = src.replace(old_locals, new_locals, 1)
+
+old_read = """        night_tuning_t t;
+        night_get_tuning(&t);
+        /* Manual override from control.c takes priority over the auto
+         * threshold logic below — applied once per change, then idle. */
+        if (t.override == NIGHT_MODE_FORCE_DAY) {
+            if (g_is_night) { switch_to_day(); g_is_night = 0; confirm = 0; }
+            continue;
+        }
+        if (t.override == NIGHT_MODE_FORCE_NIGHT) {
+            if (!g_is_night) { switch_to_night(); g_is_night = 1; confirm = 0; }
+            continue;
+        }
+"""
+new_read = """        night_tuning_t t;
+        unsigned mode_generation = night_get_snapshot(&t);
+
+        /* A control-thread mode change invalidates any old debounce progress
+         * and any anti-flap lock from the previous mode. This is what makes
+         * FORCE DAY/NIGHT -> AUTO immediately re-evaluate ambient light. */
+        if (!have_mode_generation) {
+            seen_mode_generation = mode_generation;
+            have_mode_generation = 1;
+        } else if (mode_generation != seen_mode_generation) {
+            seen_mode_generation = mode_generation;
+            confirm = 0;
+            lock_until = 0;
+            printf("[night] mode changed -> reset confirm/lock\\n");
+        }
+
+        /* Manual override from control.c takes priority over the auto
+         * threshold logic below — applied once per change, then idle. */
+        if (t.override == NIGHT_MODE_FORCE_DAY) {
+            if (night_is_night()) {
+                switch_to_day();
+                night_set_state(0);
+            }
+            confirm = 0;
+            continue;
+        }
+        if (t.override == NIGHT_MODE_FORCE_NIGHT) {
+            if (!night_is_night()) {
+                switch_to_night();
+                night_set_state(1);
+            }
+            confirm = 0;
+            continue;
+        }
+"""
+if src.count(old_read) != 1:
+    raise SystemExit("ERROR: upstream night.c override block changed; refusing to patch blindly")
+src = src.replace(old_read, new_read, 1)
+
+old_trigger = """        int trigger = g_is_night ? (hw_exp < t.day_hw_exp)
+                                  : (hw_exp > t.trigger_hw_exp);
+        if (trigger) {
+            if (++confirm >= t.confirm_samples) {
+                if (g_is_night) switch_to_day(); else switch_to_night();
+                g_is_night = !g_is_night;
+                confirm    = 0;
+                lock_until = now + t.lock_ms;
+            }
+        } else {
+            confirm = 0;
+        }
+"""
+new_trigger = """        int is_night = night_is_night();
+        int trigger = is_night ? (hw_exp < t.day_hw_exp)
+                               : (hw_exp > t.trigger_hw_exp);
+        if (trigger) {
+            if (++confirm >= t.confirm_samples) {
+                if (is_night) switch_to_day(); else switch_to_night();
+                night_set_state(!is_night);
+                confirm    = 0;
+                lock_until = now + t.lock_ms;
+            }
+        } else {
+            confirm = 0;
+        }
+"""
+if src.count(old_trigger) != 1:
+    raise SystemExit("ERROR: upstream night.c auto-trigger block changed; refusing to patch blindly")
+src = src.replace(old_trigger, new_trigger, 1)
+
+path.write_text(src)
+print("patched")
+PY_NIGHT
+
+    grep -Fq 'static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;' "$night" \
+        || die "Day/night patch verification failed: mutex missing."
+    grep -Fq 'static unsigned        g_mode_generation = 0;' "$night" \
+        || die "Day/night patch verification failed: generation counter missing."
+    grep -Fq 'printf("[night] mode changed -> reset confirm/lock\\n");' "$night" \
+        || die "Day/night patch verification failed: reset logic missing."
+    ok "Applied thread-safe day/night override-to-auto recovery fix."
 
     # Give each camera a useful DHCP hostname (for example front-door).
     # CAMERA_HOSTNAME is strictly sanitized by ask_camera_name().
