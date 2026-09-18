@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.6"
+VERSION="0.2.7"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -671,22 +671,21 @@ def sub_once(pattern, replacement, label, flags=0):
         )
     src = rx.sub(lambda m: m.expand(replacement), src, count=1)
 
-# Synchronize the tuning snapshot shared between control.c and night_loop().
 if "g_mode_generation" not in src or "night_get_snapshot" not in src:
     sub_once(
         r'(?m)^(static volatile int g_is_night\s*=\s*0;[^\n]*\n)',
-        '''/* control.c updates g_tuning from a different pthread than night_loop().
+        """/* control.c updates g_tuning from a different pthread than night_loop().
  * Protect the multi-field tuning snapshot and use a generation counter so a
  * manual DAY/NIGHT/AUTO change invalidates stale debounce/lock state. */
 static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned        g_mode_generation = 0;
-\\1''',
+\\1""",
         "g_is_night declaration",
     )
 
     sub_once(
         r'(?m)^void\s+night_get_tuning\s*\(\s*night_tuning_t\s*\*out\s*\)\s*\{\s*\*out\s*=\s*g_tuning;\s*\}\s*$',
-        '''static unsigned night_get_snapshot(night_tuning_t *out)
+        """static unsigned night_get_snapshot(night_tuning_t *out)
 {
     unsigned generation;
     pthread_mutex_lock(&g_night_lock);
@@ -699,137 +698,56 @@ static unsigned        g_mode_generation = 0;
 void night_get_tuning(night_tuning_t *out)
 {
     (void)night_get_snapshot(out);
-}''',
+}""",
         "night_get_tuning()",
     )
 
     sub_once(
         r'(?m)^void\s+night_set_tuning\s*\(\s*const\s+night_tuning_t\s*\*in\s*\)\s*\{\s*g_tuning\s*=\s*\*in;\s*\}\s*$',
-        '''void night_set_tuning(const night_tuning_t *in)
+        """void night_set_tuning(const night_tuning_t *in)
 {
     pthread_mutex_lock(&g_night_lock);
     if (g_tuning.override != in->override)
         ++g_mode_generation;
     g_tuning = *in;
     pthread_mutex_unlock(&g_night_lock);
-}''',
+}""",
         "night_set_tuning()",
     )
 
-loop_pattern = re.compile(
-    r'static void \*night_loop\(void \*arg\)\n\{.*?\n\}\n(?=int night_start\(void\))',
-    re.S,
-)
-matches = list(loop_pattern.finditer(src))
-if len(matches) != 1:
+loop_start_marker = "static void *night_loop(void *arg)"
+loop_end_marker   = "int night_start(void)"
+
+loop_start = src.find(loop_start_marker)
+loop_end   = src.find(loop_end_marker, loop_start + len(loop_start_marker))
+
+if loop_start < 0 or loop_end < 0 or loop_end <= loop_start:
     raise SystemExit(
-        f"ERROR: upstream night.c night_loop() layout changed "
-        f"(matched {len(matches)} times); refusing to patch blindly"
+        "ERROR: upstream night.c night_loop()/night_start() markers changed; "
+        "refusing to patch blindly"
     )
 
-new_loop = r'''static void *night_loop(void *arg)
-{
-    (void)arg;
-    int       confirm              = 0;
-    long long last_switch_ms       = 0;
-    unsigned  seen_mode_generation = 0;
-    int       have_mode_generation = 0;
+old_loop = src[loop_start:loop_end]
+expected_loop_tokens = [
+    "int       confirm",
+    "long long lock_until",
+    "night_get_tuning(&t);",
+    "NIGHT_MODE_FORCE_DAY",
+    "NIGHT_MODE_FORCE_NIGHT",
+    "ae_get_last_stats",
+    "t.day_hw_exp",
+    "t.trigger_hw_exp",
+    "lock_until = now + t.lock_ms",
+]
+missing_loop_tokens = [tok for tok in expected_loop_tokens if tok not in old_loop]
+if missing_loop_tokens:
+    raise SystemExit(
+        "ERROR: upstream night.c night_loop() logic changed; missing: "
+        + ", ".join(missing_loop_tokens)
+    )
 
-    printf("[night] auto day/night monitor started (poll=%dms)\n", POLL_US / 1000);
-
-    while (g_night_running) {
-        usleep(POLL_US);
-
-        night_tuning_t t;
-        unsigned mode_generation = night_get_snapshot(&t);
-
-        /* A manual DAY/NIGHT/AUTO change starts a fresh decision cycle. */
-        if (!have_mode_generation) {
-            seen_mode_generation = mode_generation;
-            have_mode_generation = 1;
-        } else if (mode_generation != seen_mode_generation) {
-            seen_mode_generation = mode_generation;
-            confirm = 0;
-            last_switch_ms = 0;
-            printf("[night] mode changed -> reset confirm/lock\n");
-        }
-
-        /* Manual override always wins. */
-        if (t.override == NIGHT_MODE_FORCE_DAY) {
-            if (g_is_night) {
-                switch_to_day();
-                g_is_night = 0;
-            }
-            confirm = 0;
-            last_switch_ms = 0;
-            continue;
-        }
-
-        if (t.override == NIGHT_MODE_FORCE_NIGHT) {
-            if (!g_is_night) {
-                switch_to_night();
-                g_is_night = 1;
-            }
-            confirm = 0;
-            last_switch_ms = 0;
-            continue;
-        }
-
-        long long now = now_ms();
-
-        /* Relative anti-flap lock using the CURRENT lock_ms value.
-         * This replaces the old absolute lock_until timestamp. */
-        if (last_switch_ms != 0 && t.lock_ms > 0 &&
-            now - last_switch_ms < (long long)t.lock_ms) {
-            confirm = 0;
-            continue;
-        }
-
-        int      lum;
-        uint32_t hw_exp, hw_sgain, hw_isp;
-        if (ae_get_last_stats(&lum, &hw_exp, &hw_sgain, &hw_isp) != 0)
-            continue;
-
-        int desired_night = g_is_night;
-
-        if (g_is_night) {
-            if (hw_exp < t.day_hw_exp)
-                desired_night = 0;
-        } else {
-            if (hw_exp > t.trigger_hw_exp)
-                desired_night = 1;
-        }
-
-        if (desired_night == g_is_night) {
-            confirm = 0;
-            continue;
-        }
-
-        int needed = t.confirm_samples > 0 ? t.confirm_samples : 1;
-        if (++confirm < needed)
-            continue;
-
-        if (desired_night)
-            switch_to_night();
-        else
-            switch_to_day();
-
-        g_is_night = desired_night;
-        confirm = 0;
-
-        /* Start the lock only after the potentially slow transition finished. */
-        last_switch_ms = now_ms();
-
-        printf("[night] transition complete -> state=%s lock=%dms\n",
-               g_is_night ? "night" : "day", t.lock_ms);
-    }
-
-    printf("[night] auto day/night monitor stopped\n");
-    return NULL;
-}
-'''
-
-src = loop_pattern.sub(lambda m: new_loop, src, count=1)
+new_loop = 'static void *night_loop(void *arg)\n{\n    (void)arg;\n    int       confirm              = 0;\n    long long last_switch_ms       = 0;\n    unsigned  seen_mode_generation = 0;\n    int       have_mode_generation = 0;\n\n    printf("[night] auto day/night monitor started (poll=%dms)\\n", POLL_US / 1000);\n\n    while (g_night_running) {\n        usleep(POLL_US);\n\n        night_tuning_t t;\n        unsigned mode_generation = night_get_snapshot(&t);\n\n        if (!have_mode_generation) {\n            seen_mode_generation = mode_generation;\n            have_mode_generation = 1;\n        } else if (mode_generation != seen_mode_generation) {\n            seen_mode_generation = mode_generation;\n            confirm = 0;\n            last_switch_ms = 0;\n            printf("[night] mode changed -> reset confirm/lock\\n");\n        }\n\n        if (t.override == NIGHT_MODE_FORCE_DAY) {\n            if (g_is_night) {\n                switch_to_day();\n                g_is_night = 0;\n            }\n            confirm = 0;\n            last_switch_ms = 0;\n            continue;\n        }\n\n        if (t.override == NIGHT_MODE_FORCE_NIGHT) {\n            if (!g_is_night) {\n                switch_to_night();\n                g_is_night = 1;\n            }\n            confirm = 0;\n            last_switch_ms = 0;\n            continue;\n        }\n\n        long long now = now_ms();\n\n        if (last_switch_ms != 0 && t.lock_ms > 0 &&\n            now - last_switch_ms < (long long)t.lock_ms) {\n            confirm = 0;\n            continue;\n        }\n\n        int      lum;\n        uint32_t hw_exp, hw_sgain, hw_isp;\n        if (ae_get_last_stats(&lum, &hw_exp, &hw_sgain, &hw_isp) != 0)\n            continue;\n\n        int desired_night = g_is_night;\n\n        if (g_is_night) {\n            if (hw_exp < t.day_hw_exp)\n                desired_night = 0;\n        } else {\n            if (hw_exp > t.trigger_hw_exp)\n                desired_night = 1;\n        }\n\n        if (desired_night == g_is_night) {\n            confirm = 0;\n            continue;\n        }\n\n        int needed = t.confirm_samples > 0 ? t.confirm_samples : 1;\n        if (++confirm < needed)\n            continue;\n\n        if (desired_night)\n            switch_to_night();\n        else\n            switch_to_day();\n\n        g_is_night = desired_night;\n        confirm = 0;\n        last_switch_ms = now_ms();\n\n        printf("[night] transition complete -> state=%s lock=%dms\\n",\n               g_is_night ? "night" : "day", t.lock_ms);\n    }\n\n    printf("[night] auto day/night monitor stopped\\n");\n    return NULL;\n}\n\n'
+src = src[:loop_start] + new_loop + src[loop_end:]
 
 required = [
     "static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;",
@@ -849,6 +767,7 @@ if "lock_until = now + t.lock_ms" in src or "now < lock_until" in src:
 
 path.write_text(src)
 print("patched")
+
 PY_NIGHT
 
     grep -Fq 'static pthread_mutex_t g_night_lock = PTHREAD_MUTEX_INITIALIZER;' "$night" \
