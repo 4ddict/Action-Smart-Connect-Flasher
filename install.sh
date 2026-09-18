@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.9"
+VERSION="0.3.0"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -18,6 +18,12 @@ RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
 TOOLKIT_REPO="https://github.com/tasarren/lsc-tuya-toolkit.git"
 FIRMWARE_REPO="https://github.com/FluxAlchemist/LSC_AK3918AV130_cam_custom_firmware.git"
 SMOLRTSP_REPO="https://github.com/OpenIPC/smolrtsp.git"
+
+# Known-good upstream revisions, hardware-tested with this wizard release.
+# Keep these fixed until a newer upstream revision has been reviewed and tested.
+TOOLKIT_COMMIT="396db8a"
+FIRMWARE_COMMIT="3250e0f"
+SMOLRTSP_COMMIT="8ae3b51"
 SD_LABEL="LSC_DECLOUD"
 EXPECTED_APP_SIZE=5242880
 CAMERA_NAME=""
@@ -167,6 +173,7 @@ BANNER
     say "${DIM}Anyka AK3918AV130 • ak_rtsp • Linux${RESET}"
     say ""
     say "Version ${BOLD}${VERSION}${RESET}"
+    say "${DIM}Pinned sources: toolkit ${TOOLKIT_COMMIT} • firmware ${FIRMWARE_COMMIT} • SmolRTSP ${SMOLRTSP_COMMIT}${RESET}"
     say ""
     say "This wizard will guide you through every physical step."
     say "No Telnet commands, cross-compiling knowledge, or MTD knowledge is required."
@@ -272,22 +279,82 @@ install_dependencies() {
     ok "Dependencies installed."
 }
 
+checkout_pinned_repo() {
+    # Usage: checkout_pinned_repo NAME URL DIR BRANCH COMMIT
+    local name="$1" url="$2" dir="$3" branch="$4" commit="$5"
+    local actual shallow
+
+    if [[ -d "$dir/.git" ]]; then
+        git -C "$dir" remote set-url origin "$url" >/dev/null 2>&1 || true
+
+        # Throw away previous build patches/artifacts in this disposable cache.
+        git -C "$dir" reset --hard --quiet
+        git -C "$dir" clean -fdx --quiet
+
+        # Old wizard versions used --depth 1. If the pinned object is not in
+        # that shallow cache, expand it once so the historical pin is reachable.
+        if ! git -C "$dir" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+            shallow="$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null || echo false)"
+            if [[ "$shallow" == "true" ]]; then
+                info "Expanding old shallow cache for $name..."
+                git -C "$dir" fetch --quiet --unshallow origin "$branch" \
+                    || die "Could not fetch full history for pinned $name source."
+            else
+                git -C "$dir" fetch --quiet origin "$branch" \
+                    || die "Could not fetch pinned $name source."
+            fi
+        fi
+    else
+        rm -rf "$dir"
+        info "Cloning pinned $name source..."
+        # Full history is intentional: it makes the abbreviated known-good
+        # commit ID resolvable even after upstream moves its default branch.
+        git clone --quiet "$url" "$dir" \
+            || die "Could not clone $name."
+    fi
+
+    # The pin must exist locally. Never silently fall back to branch HEAD.
+    git -C "$dir" cat-file -e "${commit}^{commit}" 2>/dev/null \
+        || die "Pinned $name commit $commit is not available."
+
+    git -C "$dir" checkout --detach --quiet "$commit" \
+        || die "Could not check out pinned $name commit $commit."
+    git -C "$dir" reset --hard --quiet "$commit"
+    git -C "$dir" clean -fdx --quiet
+
+    actual="$(git -C "$dir" rev-parse --short=7 HEAD)"
+    [[ "$actual" == "$commit" ]] \
+        || die "Pinned $name verification failed: expected $commit, got $actual."
+
+    ok "$name pinned at $actual."
+}
+
 update_sources() {
-    info "Downloading/updating the two upstream projects..."
-    if [[ -d "$SRC_DIR/toolkit/.git" ]]; then
-        git -C "$SRC_DIR/toolkit" fetch --quiet origin
-        git -C "$SRC_DIR/toolkit" reset --hard origin/main --quiet
-    else
-        rm -rf "$SRC_DIR/toolkit"
-        git clone --depth 1 "$TOOLKIT_REPO" "$SRC_DIR/toolkit"
-    fi
-    if [[ -d "$SRC_DIR/firmware/.git" ]]; then
-        git -C "$SRC_DIR/firmware" fetch --quiet origin
-        git -C "$SRC_DIR/firmware" reset --hard origin/main --quiet
-    else
-        rm -rf "$SRC_DIR/firmware"
-        git clone --depth 1 "$FIRMWARE_REPO" "$SRC_DIR/firmware"
-    fi
+    info "Preparing hardware-tested pinned upstream sources..."
+
+    checkout_pinned_repo \
+        "LSC toolkit" \
+        "$TOOLKIT_REPO" \
+        "$SRC_DIR/toolkit" \
+        "main" \
+        "$TOOLKIT_COMMIT"
+
+    checkout_pinned_repo \
+        "AK3918 custom firmware" \
+        "$FIRMWARE_REPO" \
+        "$SRC_DIR/firmware" \
+        "main" \
+        "$FIRMWARE_COMMIT"
+
+    # SmolRTSP lives inside the firmware workspace because ak_rtsp's Makefile
+    # expects ../smolrtsp relative to src/ak_rtsp.
+    checkout_pinned_repo \
+        "SmolRTSP" \
+        "$SMOLRTSP_REPO" \
+        "$SRC_DIR/firmware/src/smolrtsp" \
+        "master" \
+        "$SMOLRTSP_COMMIT"
+
     local required=(
         "$SRC_DIR/toolkit/sd_card/hack.sh"
         "$SRC_DIR/toolkit/sd_card/custom/scripts/entrypoint.sh"
@@ -299,10 +366,15 @@ update_sources() {
         "$SRC_DIR/firmware/src/ak_rtsp/rtsp.c"
         "$SRC_DIR/firmware/src/ak_rtsp/night.c"
         "$SRC_DIR/firmware/tools/firmware_patch_templates/ak_rtsp_wrapper.sh"
+        "$SRC_DIR/firmware/src/smolrtsp/CMakeLists.txt"
     )
-    for f in "${required[@]}"; do [[ -f "$f" ]] || die "Upstream layout changed; missing: $f"; done
-    ok "Upstream sources ready."
+    for f in "${required[@]}"; do
+        [[ -f "$f" ]] || die "Pinned upstream layout is incomplete; missing: $f"
+    done
+
+    ok "All pinned upstream sources verified."
 }
+
 show_disks() {
     say ""
     say "Storage devices currently visible to Linux:"
@@ -889,10 +961,8 @@ build_firmware() {
     smol="$SRC_DIR/firmware/src/smolrtsp"
     app_extract="$CAMERA_BUILD_DIR/app_extracted"
     outdir="$CAMERA_BUILD_DIR/output"
-    if [[ ! -d "$smol/.git" ]]; then
-        rm -rf "$smol"
-        git clone --depth 1 "$SMOLRTSP_REPO" "$smol"
-    fi
+    [[ -d "$smol/.git" ]] || die "Pinned SmolRTSP checkout is missing."
+    [[ "$(git -C "$smol" rev-parse --short=7 HEAD)" == "$SMOLRTSP_COMMIT" ]]         || die "SmolRTSP moved away from pinned commit $SMOLRTSP_COMMIT."
     cmake -S "$smol" -B "$smol/build" >/dev/null
 
     patch_native_linux_build
@@ -1092,6 +1162,9 @@ main() {
 case "${1:-}" in
     --version|-V)
         echo "LSC 3215672.2 Decloud Wizard v$VERSION"
+        echo "Toolkit:  $TOOLKIT_COMMIT"
+        echo "Firmware: $FIRMWARE_COMMIT"
+        echo "SmolRTSP: $SMOLRTSP_COMMIT"
         exit 0
         ;;
     --help|-h)
