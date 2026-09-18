@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.3"
+VERSION="0.2.4"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -732,8 +732,12 @@ static void night_set_state(int state)
 }
 """
 
+# Current upstream night.c has a two-line explanatory comment immediately
+# before g_tuning. Match the functional block itself, independent of comments.
+if old_shared not in src:
+    raise SystemExit("ERROR: upstream night.c shared-state code changed; refusing to patch blindly")
 if src.count(old_shared) != 1:
-    raise SystemExit("ERROR: upstream night.c shared-state block changed; refusing to patch blindly")
+    raise SystemExit("ERROR: upstream night.c shared-state code is ambiguous; refusing to patch blindly")
 src = src.replace(old_shared, new_shared, 1)
 
 old_locals = """    int       confirm    = 0;
