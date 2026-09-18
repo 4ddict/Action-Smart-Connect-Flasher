@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.2.7"
+VERSION="0.2.8"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -108,9 +108,49 @@ quit_cleanly() {
 }
 
 cleanup_mount() {
+    local part target
+
+    # First unmount the wizard's own mount point.
     if mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
         sudo umount "$MOUNT_DIR" >/dev/null 2>&1 || true
     fi
+
+    # Then unmount every mount of the selected SD card. Desktop environments
+    # may auto-mount the same partition under /run/media/... after reinsertion.
+    if [[ -n "${SD_PART:-}" && -b "${SD_PART:-}" ]]; then
+        while IFS= read -r target; do
+            [[ -n "$target" ]] || continue
+            sudo umount "$target" >/dev/null 2>&1 || true
+        done < <(findmnt -rn -S "$SD_PART" -o TARGET 2>/dev/null || true)
+    fi
+
+    if [[ -n "${SD_DEV:-}" && -b "${SD_DEV:-}" ]]; then
+        while read -r part; do
+            [[ -b "$part" ]] || continue
+            while IFS= read -r target; do
+                [[ -n "$target" ]] || continue
+                sudo umount "$target" >/dev/null 2>&1 || true
+            done < <(findmnt -rn -S "$part" -o TARGET 2>/dev/null || true)
+        done < <(lsblk -lnpo NAME,TYPE "$SD_DEV" 2>/dev/null | awk '$2=="part" {print $1}')
+    fi
+}
+
+prepare_sd_for_removal() {
+    sync
+    cleanup_mount
+
+    # Refuse to tell the user to remove the card while Linux still has one of
+    # its partitions mounted.
+    if [[ -n "${SD_DEV:-}" && -b "${SD_DEV:-}" ]]; then
+        local part
+        while read -r part; do
+            if findmnt -rn -S "$part" >/dev/null 2>&1; then
+                die "The SD card is still mounted. Close any file-manager window using it and run this step again."
+            fi
+        done < <(lsblk -lnpo NAME,TYPE "$SD_DEV" 2>/dev/null | awk '$2=="part" {print $1}')
+    fi
+
+    ok "SD card synced and safely unmounted."
 }
 trap cleanup_mount EXIT
 
@@ -151,22 +191,17 @@ ensure_wizard_assets() {
 }
 confirm_model() {
     say ""
-    say "Look at the sticker on the camera box or camera."
-    say "The article number must read exactly: ${BOLD}3215672.2${RESET}"
+    say "Check the sticker on the camera box or camera."
     say ""
-    while true; do
-        printf "Type the article number (or Q to quit): "
-        read -r model
-        if [[ "${model^^}" == "Q" ]]; then
-            quit_cleanly
-        elif [[ "$model" == "3215672.2" ]]; then
-            ok "Correct camera model confirmed."
-            return
-        else
-            warn "That is not 3215672.2. Please check the sticker and try again."
-            say "This wizard must not be used on 3215672, 3215672.1 or another model."
-        fi
-    done
+    say "Supported model: ${BOLD}3215672.2 / SI B26101${RESET}"
+    say "Do ${BOLD}not${RESET} continue with 3215672, 3215672.1 or another revision."
+    say ""
+    if ask_yes_no "Are you sure this is exactly 3215672.2 / SI B26101?" no; then
+        ok "Correct camera model confirmed."
+    else
+        warn "Model not confirmed. Nothing has been changed."
+        quit_cleanly
+    fi
 }
 ask_camera_name() {
     say ""
@@ -492,7 +527,7 @@ EOF_HOOK
     ok "Stage 1 SD card is ready."
 }
 stage1_physical_instructions() {
-    cleanup_mount
+    prepare_sd_for_removal
     say ""
     say "${BOLD}STAGE 1 — Back up the camera and save Wi-Fi permanently${RESET}"
     say ""
@@ -639,6 +674,31 @@ EOF_VERSION
         ok "RTSP/TCP integrity fix is already present."
     fi
 
+    # Calibrated GC20C3 automatic day/night thresholds.
+    #
+    # Hardware testing on the supported camera showed:
+    #   - 1800 switched to NIGHT earlier than desired
+    #   - 800 made returning to DAY unnecessarily reluctant
+    # Use wider practical hysteresis: NIGHT above 3000, DAY below 1200.
+    local night="$akdir/night.c"
+    if grep -Eq '^#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+1800([[:space:]]|$)' "$night"; then
+        sed -i -E 's/^(#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+)1800([[:space:]]*)$/\13000\2/' "$night"
+    elif ! grep -Eq '^#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+3000([[:space:]]|$)' "$night"; then
+        die "Upstream NIGHT_TRIGGER_HW_EXP changed; refusing to retune blindly."
+    fi
+
+    if grep -Eq '^#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+800([[:space:]]|$)' "$night"; then
+        sed -i -E 's/^(#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+)800([[:space:]]*)$/\11200\2/' "$night"
+    elif ! grep -Eq '^#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+1200([[:space:]]|$)' "$night"; then
+        die "Upstream DAY_TRIGGER_HW_EXP changed; refusing to retune blindly."
+    fi
+
+    grep -Eq '^#define[[:space:]]+NIGHT_TRIGGER_HW_EXP[[:space:]]+3000([[:space:]]|$)' "$night" \
+        || die "Night threshold patch verification failed."
+    grep -Eq '^#define[[:space:]]+DAY_TRIGGER_HW_EXP[[:space:]]+1200([[:space:]]|$)' "$night" \
+        || die "Day threshold patch verification failed."
+    ok "Applied calibrated day/night thresholds: NIGHT=3000, DAY=1200."
+
     # Day/night override -> auto recovery fix.
     #
     # night.c is read by the auto-monitor thread while control.c can update the
@@ -651,7 +711,6 @@ EOF_VERSION
     #   FORCE NIGHT -> AUTO in daylight -> DAY
     #
     # are evaluated immediately from fresh AE statistics.
-    local night="$akdir/night.c"
     python3 - "$night" <<'PY_NIGHT'
 from pathlib import Path
 import re
@@ -835,7 +894,7 @@ build_firmware() {
     ok "Firmware built and verified: $FIRMWARE_NAME"
 }
 stage2_physical_instructions() {
-    cleanup_mount
+    prepare_sd_for_removal
     say ""
     say "${BOLD}STAGE 2 — Flash the cloud-free firmware${RESET}"
     say ""
