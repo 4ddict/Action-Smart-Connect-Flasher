@@ -4,7 +4,11 @@ set -Eeuo pipefail
 # Beginner-friendly Linux installer for the Action LSC Smart Connect 3215672.2
 # This project does NOT redistribute vendor firmware. It builds a custom APP
 # image from the user's own camera dump.
-VERSION="0.3.0"
+# Debian-derived desktops may omit sbin directories from a regular user's PATH.
+# Include them for tool detection without running the whole wizard as root.
+# Append them so the user's existing tool choices keep their precedence.
+export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin"
+VERSION="0.3.1"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -264,9 +268,10 @@ install_dependencies() {
         sudo pacman -S --needed --noconfirm curl git cmake make zig python squashfs-tools dosfstools util-linux expect inetutils file
     elif have apt-get; then
         sudo apt-get update
-        # Package naming differs slightly between Debian/Ubuntu releases.
-        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux expect telnet file || \
-        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux expect inetutils-telnet file
+        # Debian/Ubuntu package sfdisk separately in fdisk, not util-linux.
+        # Telnet package naming differs slightly between releases.
+        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux fdisk expect telnet file || \
+        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux fdisk expect inetutils-telnet file
         if ! have zig; then
             die "Zig is not available from your configured APT repositories. Install Zig, then run this wizard again."
         fi
