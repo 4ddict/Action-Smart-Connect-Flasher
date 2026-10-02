@@ -25,7 +25,7 @@ That is all you need to download manually. The wizard downloads its helper files
 ### Version 0.3.2
 
 - Recognises the two additional camera labels reported in [issue #2](https://github.com/4ddict/Action-Smart-Connect-Flasher/issues/2), while retaining the exact MTD layout and backup checks.
-- Downloads an official, SHA-256-verified Zig compiler when Zig is missing, including on Debian/Q4OS.
+- Downloads an official, SHA-256-verified Zig compiler when Zig is missing, including on Debian/Q4OS ;).
 - Temporarily suppresses desktop automount for the selected SD card when udev/UDisks is available, and checks that it is unmounted before formatting.
 - Documents the firmware's existing local camera controls below.
 
