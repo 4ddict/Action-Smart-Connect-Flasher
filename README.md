@@ -65,12 +65,7 @@ It walks you through the complete process using numbered choices and plain-Engli
 
 The wizard currently supports dependency installation on **Arch/CachyOS**, **Debian/Ubuntu** and **Fedora-family** systems where the required packages are available.
 
-The wizard checks the available tools before choosing `pacman`, APT or `dnf`. If everything is installed, it skips package installation. An existing Zig installation is used when it can run on the computer. Arch/CachyOS and Fedora first try their native Zig package when it is missing.
-
-If Zig remains unavailable, the wizard can download **Zig 0.14.1 directly from ziglang.org** into its own cache after you approve dependency installation. It verifies the published SHA-256 checksum before extracting or running it. No additional APT repository is needed.
-
-Automatic Zig downloads are configured for Linux x86 (32-bit), x86_64, AArch64, ARMv7 and RISC-V 64-bit hosts.
-
+The wizard checks the available tools before choosing `pacman`, APT or `dnf`. If everything is installed, it skips package installation.
 ---
 
 ## ⚠️ Check the model before you start
