@@ -1,8 +1,8 @@
-# 📷 LSC 3215672.2 Decloud Wizard
+# 📷 LSC Smart Connect Decloud Wizard
 
 **Turn the €9.95 Action LSC Smart Connect indoor camera into a local RTSP camera — without needing to know Telnet, MTD flash layouts, cross-compilers, or Linux device names.**
 
-> ✅ Designed for **Action LSC Smart Connect 3215672.2 / SI B26101**  
+> ✅ Originally tested on **3215672.2 / SI B26101**; additional community reports listed below\
 > 📡 Local 1080p RTSP via `ak_rtsp`  
 > ☁️ Removes the Tuya `anyka_ipc` cloud application from the APP partition  
 > 💾 Creates a full stock firmware backup before flashing  
@@ -21,6 +21,15 @@ curl -fsSL https://raw.githubusercontent.com/4ddict/Action-Smart-Connect-Flasher
 That is all you need to download manually. The wizard downloads its helper files and the required upstream projects automatically.
 
 **Do not run the complete wizard with `sudo`.** It will ask for your sudo password only when it needs to format/mount the SD card or install packages.
+
+### Version 0.3.2
+
+- Recognises the two additional camera labels reported in [issue #2](https://github.com/4ddict/Action-Smart-Connect-Flasher/issues/2), while retaining the exact MTD layout and backup checks.
+- Downloads an official, SHA-256-verified Zig compiler when Zig is missing, including on Debian/Q4OS.
+- Temporarily suppresses desktop automount for the selected SD card when udev/UDisks is available, and checks that it is unmounted before formatting.
+- Documents the firmware's existing local camera controls below. No settings choice is added to the installation wizard.
+
+Version 0.3.1 already fixed detection of tools in `/sbin` and the separate Debian `fdisk` package. The complete wizard now refuses to run as root; start it as your regular user.
 
 ---
 
@@ -48,7 +57,7 @@ It walks you through the complete process using numbered choices and plain-Engli
 
 | Item | Requirement |
 | --- | --- |
-| Camera | **LSC Smart Connect 3215672.2 / SI B26101** |
+| Camera | One of the exact labels in the compatibility table below |
 | Computer | Linux PC/laptop |
 | microSD | Any small card is sufficient; its contents will be erased |
 | Wi-Fi | 2.4 GHz network |
@@ -56,17 +65,25 @@ It walks you through the complete process using numbered choices and plain-Engli
 
 The wizard currently supports dependency installation on **Arch/CachyOS**, **Debian/Ubuntu** and **Fedora-family** systems where the required packages are available.
 
+The wizard checks the available tools before choosing `pacman`, APT or `dnf`. If everything is installed, it skips package installation. An existing Zig installation is used when it can run on the computer. Arch/CachyOS and Fedora first try their native Zig package when it is missing.
+
+If Zig remains unavailable, the wizard can download **Zig 0.14.1 directly from ziglang.org** into its own cache after you approve dependency installation. It verifies the published SHA-256 checksum before extracting or running it. No additional APT repository is needed.
+
+Automatic Zig downloads are configured for Linux x86 (32-bit), x86_64, AArch64, ARMv7 and RISC-V 64-bit hosts. The compiler cache is reused on later runs.
+
 ---
 
 ## ⚠️ Check the model before you start
 
-This installer is for:
+Choose the exact article number and SI code printed on your camera or box:
 
-```text
-Art. No. 3215672.2
-SI B26101
-SoC: Anyka AK3918AV130
-```
+| Article number | SI code | Evidence |
+| --- | --- | --- |
+| **3215672.2** | **B26101** | Original hardware-tested camera, Anyka AK3918AV130 |
+| **3215672.2** | **C26101** | A successful installation with wizard 0.3.0 was reported in [issue #2](https://github.com/4ddict/Action-Smart-Connect-Flasher/issues/2) |
+| **3215672.3** | **D26228** | A successful installation with wizard 0.3.0 was reported in [issue #2](https://github.com/4ddict/Action-Smart-Connect-Flasher/issues/2) |
+
+The additional variants have not been independently hardware-tested by this project. Their inclusion is based on that user's successful installations. A matching label alone does not bypass the camera-side checks.
 
 It is **not** for:
 
@@ -75,7 +92,7 @@ It is **not** for:
 3215672.1
 ```
 
-Those revisions use different hardware/firmware. The wizard asks for the article number and also verifies the exact MTD partition map on the camera before allowing a flash.
+Do not assume other SI codes or revisions are compatible. The wizard asks for the exact label and verifies the same MTD partition map on the camera before allowing a flash. A different layout is rejected.
 
 ---
 
@@ -151,6 +168,46 @@ For multiple cameras, create a DHCP reservation for each camera in your router. 
 
 ---
 
+## 🎛️ Live camera settings
+
+The pinned upstream `ak_rtsp` firmware already includes a local, text-based control service on **TCP port 8091**. You can change settings after installation without rebuilding or reflashing firmware. This is not an HTTP API.
+
+For example, connect from a computer on the same local network using netcat:
+
+```bash
+nc <camera-ip> 8091
+```
+
+If `nc` is missing on Debian/Q4OS/Ubuntu, install it with `sudo apt-get install netcat-openbsd`. On Arch/CachyOS the package is `openbsd-netcat`; on Fedora, `nmap-ncat` supplies the `ncat` command, which can be used in place of `nc`.
+
+Type a command and press Enter. Start by reading the available settings:
+
+```text
+LIST
+GET night.mode
+GET night.state
+```
+
+| Command | Effect |
+| --- | --- |
+| `SET night.mode day` | Force day mode: IR illumination off and the IR-cut filter in its daytime position |
+| `SET night.mode night` | Force night mode: IR illumination on and the IR-cut filter in its night position |
+| `SET night.mode auto` | Return to automatic day/night switching |
+| `GET night.state` | Read the current day/night state; this value is read-only |
+| `SET isp.brightness 10` | Adjust brightness; accepted range is -50 to 50, with 0 as the neutral setting |
+
+`isp.contrast`, `isp.saturation` and `isp.sharpness` also accept values from -50 to 50. `LIST` shows the exposure and automatic day/night tuning parameters as well. Change one setting at a time and record its previous value.
+
+Day/night mode coordinates the IR LEDs, IR-cut filter and sensor settings; it is not an independent IR-LED switch. A mode change is applied by the monitor thread, so allow a moment before reading `night.state` again.
+
+Replies beginning with `OK` acknowledge a change; `ERR` indicates a rejected command. Lines beginning with `LOG` are live camera logs. Press Ctrl+C to disconnect.
+
+These are **runtime settings**: they reset when `ak_rtsp` restarts or the camera reboots. The service has no authentication or encryption. Keep port 8091 on a trusted local network and do not expose it to the Internet.
+
+The protocol is implemented by upstream [control.c](https://github.com/FluxAlchemist/LSC_AK3918AV130_cam_custom_firmware/blob/3250e0f/src/ak_rtsp/control.c).
+
+---
+
 ## 🔐 Wi-Fi handling
 
 The installer:
@@ -202,6 +259,16 @@ The wizard checks the SD card afterwards and will tell you whether Stage 1 actua
 ---
 
 ## 🛠️ Troubleshooting
+
+### Zig is not available in Debian/Q4OS repositories
+
+Version 0.3.2 can install the checksum-verified official compiler automatically after you accept dependency installation. You do not need to add a third-party repository. The first compiler run can take a long time on an older computer, especially while Zig prepares its ARM target libraries. Later runs can benefit from Zig's compiler cache; the wizard still rebuilds the executables.
+
+### The SD card remounts while being prepared
+
+The wizard uses a temporary udev rule to tell UDisks to ignore only the selected card while the wizard works on it. It removes the rule before card removal or when the wizard exits. It checks for remaining mounts before wiping or formatting.
+
+Close file-manager windows using the card. If your desktop uses another automounter, or `udevadm` is unavailable, disable that desktop's automount option temporarily and rerun the wizard. Do not force formatting of a mounted card.
 
 ### Stage 1 says it did not complete
 
