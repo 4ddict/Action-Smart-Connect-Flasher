@@ -8,7 +8,8 @@ set -Eeuo pipefail
 # Include them for tool detection without running the whole wizard as root.
 # Append them so the user's existing tool choices keep their precedence.
 export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin"
-VERSION="0.3.1"
+VERSION="0.3.2"
+ZIG_VERSION="0.14.1"
 WORK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lsc-3215672-decloud-wizard"
 SRC_DIR="$WORK_DIR/sources"
 BACKUP_DIR="$WORK_DIR/backups"
@@ -35,6 +36,10 @@ CAMERA_HOSTNAME=""
 CAMERA_BACKUP_DIR=""
 CAMERA_BUILD_DIR=""
 LATEST_BACKUP_FILE=""
+CAMERA_MODEL="3215672.2"
+CAMERA_SI="B26101"
+AUTOMOUNT_RULE=""
+AUTOMOUNT_DISK=""
 # When run from a cloned/downloaded repository, use the local helper scripts.
 # When launched with the one-line curl command, fetch those tiny helpers into
 # the cache directory so the user still only has to run one command.
@@ -160,11 +165,15 @@ prepare_sd_for_removal() {
         done < <(lsblk -lnpo NAME,TYPE "$SD_DEV" 2>/dev/null | awk '$2=="part" {print $1}')
     fi
 
+    # Do not retrigger this still-connected card: that could mount it again
+    # immediately before the user removes it. Reinsertion refreshes its state.
+    restore_sd_automount
     ok "SD card synced and safely unmounted."
 }
-trap cleanup_mount EXIT
-
-mkdir -p "$WORK_DIR" "$SRC_DIR" "$BACKUP_DIR" "$BUILD_DIR" "$MOUNT_DIR" "$RUNTIME_DIR"
+cleanup() {
+    cleanup_mount || true
+    restore_sd_automount refresh || true
+}
 banner() {
     clear 2>/dev/null || true
     cat <<'BANNER'
@@ -182,7 +191,8 @@ BANNER
     say "This wizard will guide you through every physical step."
     say "No Telnet commands, cross-compiling knowledge, or MTD knowledge is required."
     say ""
-    warn "Supported model ONLY: 3215672.2 / SI B26101"
+    info "Supported variants: 3215672.2 / SI B26101 or C26101; 3215672.3 / SI D26228."
+    info "C26101 and D26228 are community-reported; the exact flash layout is still verified."
 }
 ensure_wizard_assets() {
     local missing=0 f
@@ -204,15 +214,20 @@ confirm_model() {
     say ""
     say "Check the sticker on the camera box or camera."
     say ""
-    say "Supported model: ${BOLD}3215672.2 / SI B26101${RESET}"
-    say "Do ${BOLD}not${RESET} continue with 3215672, 3215672.1 or another revision."
+    say "  1) 3215672.2 / SI B26101 — original hardware-tested variant"
+    say "  2) 3215672.2 / SI C26101 — successful installation reported by a user"
+    say "  3) 3215672.3 / SI D26228 — successful installation reported by a user"
+    say "  0) Another model / not sure — quit"
     say ""
-    if ask_yes_no "Are you sure this is exactly 3215672.2 / SI B26101?" no; then
-        ok "Correct camera model confirmed."
-    else
-        warn "Model not confirmed. Nothing has been changed."
-        quit_cleanly
-    fi
+    ask_menu "Choose the exact label on your camera: " 0 3
+    case "$REPLY" in
+        1) CAMERA_MODEL="3215672.2"; CAMERA_SI="B26101" ;;
+        2) CAMERA_MODEL="3215672.2"; CAMERA_SI="C26101" ;;
+        3) CAMERA_MODEL="3215672.3"; CAMERA_SI="D26228" ;;
+        0) quit_cleanly ;;
+    esac
+    ok "Camera label confirmed: $CAMERA_MODEL / SI $CAMERA_SI."
+    say "The camera's exact MTD partition layout must also match before flashing."
 }
 ask_camera_name() {
     say ""
@@ -250,9 +265,92 @@ ask_camera_name() {
     done
 }
 have() { command -v "$1" >/dev/null 2>&1; }
+zig_release() {
+    case "$(uname -m)" in
+        x86_64|amd64)
+            if [[ "$(getconf LONG_BIT 2>/dev/null || true)" == 32 ]]; then
+                ZIG_PLATFORM="x86-linux"
+            else
+                ZIG_PLATFORM="x86_64-linux"
+            fi ;;
+        i386|i486|i586|i686|x86) ZIG_PLATFORM="x86-linux" ;;
+        aarch64|arm64) ZIG_PLATFORM="aarch64-linux" ;;
+        armv7l|armv8l) ZIG_PLATFORM="armv7a-linux" ;;
+        riscv64) ZIG_PLATFORM="riscv64-linux" ;;
+        *) return 1 ;;
+    esac
+    # SHA-256 values published at https://ziglang.org/download/index.json.
+    case "$ZIG_PLATFORM" in
+        x86_64-linux) ZIG_SHA256="24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c" ;;
+        x86-linux) ZIG_SHA256="4bce6347fa112247443cb0952c19e560d1f90b910506cf895fd07a7b8d1c4a76" ;;
+        aarch64-linux) ZIG_SHA256="f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b" ;;
+        armv7a-linux) ZIG_SHA256="1b34d9ecfaeb3b360e86c0bc233e1a8a2bbed2d40f2d4f20c12bde2128714324" ;;
+        riscv64-linux) ZIG_SHA256="005f214f74dbafb7b4d8bd305f4e9d25048f711d9ec6fa7b3d4fca177e11b882" ;;
+    esac
+    ZIG_INSTALL_DIR="$WORK_DIR/tools/zig-$ZIG_VERSION-$ZIG_PLATFORM"
+}
+activate_cached_zig() {
+    zig_release || return 1
+    [[ -x "$ZIG_INSTALL_DIR/zig" ]] || return 1
+    [[ "$("$ZIG_INSTALL_DIR/zig" version 2>/dev/null || true)" == "$ZIG_VERSION" ]] || return 1
+    export PATH="$ZIG_INSTALL_DIR:$PATH"
+}
+ensure_zig() {
+    if have zig; then
+        zig version >/dev/null 2>&1 || die "The installed Zig cannot run on this computer."
+        return
+    fi
+    activate_cached_zig && return 0
+    zig_release || die "No automatic Zig download is configured for $(uname -m). Install Zig manually."
+    info "Downloading official Zig $ZIG_VERSION for $ZIG_PLATFORM (about 50 MB)..."
+    python3 - "$ZIG_INSTALL_DIR" "$ZIG_VERSION" "$ZIG_PLATFORM" "$ZIG_SHA256" <<'PY_ZIG' || die "Official Zig installation failed. Check the download error above and run the wizard again."
+from pathlib import Path
+import hashlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+target = Path(sys.argv[1])
+version, platform, expected = sys.argv[2:]
+url = f"https://ziglang.org/download/{version}/zig-{platform}-{version}.tar.xz"
+target.parent.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix=".zig-download-", dir=target.parent) as work:
+    work = Path(work)
+    archive = work / "zig.tar.xz"
+    subprocess.run(["curl", "-fL", "--retry", "3", "--connect-timeout", "15",
+                    "--max-time", "600", url, "-o", str(archive)], check=True)
+    digest = hashlib.sha256()
+    with archive.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        raise SystemExit("ERROR: Zig checksum mismatch; nothing was installed.")
+    extracted = work / "extracted"
+    extracted.mkdir()
+    subprocess.run(["tar", "-xJf", str(archive), "--no-same-owner", "--strip-components=1",
+                    "-C", str(extracted)], check=True)
+    actual = subprocess.check_output([str(extracted / "zig"), "version"], text=True).strip()
+    if actual != version:
+        raise SystemExit(f"ERROR: Zig reported {actual}, expected {version}.")
+    # Replace only this wizard-owned, versioned compiler cache, after validation.
+    if target.is_symlink():
+        raise SystemExit("ERROR: Zig cache is a symlink; refusing to replace it.")
+    if target.exists():
+        shutil.rmtree(target)
+    extracted.rename(target)
+PY_ZIG
+    activate_cached_zig || die "The downloaded Zig could not be activated."
+    ok "Verified Zig $ZIG_VERSION is ready."
+}
 install_dependencies() {
-    local missing=()
-    local cmds=(curl git cmake make zig python3 unsquashfs mksquashfs mkfs.vfat sfdisk lsblk findmnt expect telnet file)
+    local missing=() c need_packages=0
+    if have zig; then
+        zig version >/dev/null 2>&1 || die "The installed Zig cannot run on this computer."
+    else
+        activate_cached_zig || true
+    fi
+    local cmds=(curl git cmake make zig python3 unsquashfs mksquashfs mkfs.vfat sfdisk lsblk findmnt expect telnet file tar xz)
     for c in "${cmds[@]}"; do have "$c" || missing+=("$c"); done
     if ((${#missing[@]} == 0)); then
         ok "All required tools are installed."
@@ -264,22 +362,37 @@ install_dependencies() {
         say "The wizard cannot continue without these tools."
         quit_cleanly
     fi
+    for c in "${missing[@]}"; do [[ "$c" == zig ]] || need_packages=1; done
+    local native_zig=() native_packages=()
+    have zig || native_zig=(zig)
     if have pacman; then
-        sudo pacman -S --needed --noconfirm curl git cmake make zig python squashfs-tools dosfstools util-linux expect inetutils file
+        native_packages=(curl git cmake make python squashfs-tools dosfstools util-linux expect inetutils file tar xz)
+        if ! sudo pacman -S --needed --noconfirm "${native_packages[@]}" "${native_zig[@]}"; then
+            ((${#native_zig[@]})) || die "Could not install Arch/CachyOS dependencies."
+            warn "Package installation with Zig failed; retrying the other tools, then using the official Zig download if needed."
+            sudo pacman -S --needed --noconfirm "${native_packages[@]}"
+        fi
     elif have apt-get; then
-        sudo apt-get update
-        # Debian/Ubuntu package sfdisk separately in fdisk, not util-linux.
-        # Telnet package naming differs slightly between releases.
-        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux fdisk expect telnet file || \
-        sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux fdisk expect inetutils-telnet file
-        if ! have zig; then
-            die "Zig is not available from your configured APT repositories. Install Zig, then run this wizard again."
+        if (( need_packages )); then
+            sudo apt-get update
+            # Debian/Ubuntu package sfdisk separately in fdisk, not util-linux.
+            # Telnet package naming differs slightly between releases.
+            sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux fdisk expect telnet file tar xz-utils || \
+            sudo apt-get install -y curl git cmake make python3 squashfs-tools dosfstools util-linux fdisk expect inetutils-telnet file tar xz-utils
         fi
     elif have dnf; then
-        sudo dnf install -y curl git cmake make zig python3 squashfs-tools dosfstools util-linux expect telnet file
+        native_packages=(curl git cmake make python3 squashfs-tools dosfstools util-linux expect telnet file tar xz)
+        if ! sudo dnf install -y "${native_packages[@]}" "${native_zig[@]}"; then
+            ((${#native_zig[@]})) || die "Could not install Fedora dependencies."
+            warn "Package installation with Zig failed; retrying the other tools, then using the official Zig download if needed."
+            sudo dnf install -y "${native_packages[@]}"
+        fi
+    elif (( need_packages == 0 )); then
+        : # Only Zig is missing; its official download needs no package manager.
     else
         die "Unsupported package manager. Install the missing tools manually: ${missing[*]}"
     fi
+    ensure_zig
     for c in "${cmds[@]}"; do have "$c" || die "Required command '$c' is still missing."; done
     ok "Dependencies installed."
 }
@@ -428,7 +541,7 @@ choose_sd_device() {
     say ""
     say "1. Put the microSD card in your computer or card reader."
     say "2. Wait a few seconds for Linux to detect it."
-    say "3. If it appears in your file manager, open it once so it is mounted."
+    say "3. Close any file-manager window using the card; the wizard will mount it."
     say "   If it is blank or cannot be opened, that is okay; the wizard will format it."
     say "4. Come back to this terminal."
     say ""
@@ -481,34 +594,93 @@ choose_sd_device() {
 partition_path() {
     if [[ "$1" =~ [0-9]$ ]]; then printf '%sp1' "$1"; else printf '%s1' "$1"; fi
 }
+suppress_sd_automount() {
+    # A desktop can remount newly-created partitions between sfdisk and mkfs.
+    # UDisks honours this temporary udev hint for only the selected SD device.
+    local disk name
+    disk="${SD_DEV##*/}"
+    [[ "$disk" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid SD device name."
+    if ! have udevadm; then
+        warn "udevadm is unavailable. Disable desktop automount if the SD card keeps remounting."
+        return 0
+    fi
+    [[ "$AUTOMOUNT_DISK" != "$disk" || -z "$AUTOMOUNT_RULE" ]] || return 0
+    restore_sd_automount refresh
+    sudo mkdir -p /run/udev/rules.d
+    AUTOMOUNT_RULE="$(sudo mktemp /run/udev/rules.d/99-lsc-decloud-XXXXXX.rules)"
+    AUTOMOUNT_DISK="$disk"
+    printf 'SUBSYSTEM=="block", KERNEL=="%s", ENV{UDISKS_IGNORE}="1"\nSUBSYSTEM=="block", KERNELS=="%s", ENV{UDISKS_IGNORE}="1"\n' \
+        "$disk" "$disk" | sudo tee "$AUTOMOUNT_RULE" >/dev/null
+    sudo chmod 644 "$AUTOMOUNT_RULE"
+    sudo udevadm control --reload-rules
+    while IFS= read -r name; do
+        [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid SD partition name."
+        sudo udevadm trigger --action=change "/sys/class/block/$name"
+    done < <(lsblk -lnro KNAME "$SD_DEV")
+    sudo udevadm settle
+    ok "Desktop automount temporarily suppressed for $SD_DEV."
+}
+restore_sd_automount() {
+    [[ -n "$AUTOMOUNT_RULE" ]] || return 0
+    local disk="$AUTOMOUNT_DISK" name
+    if ! sudo unlink "$AUTOMOUNT_RULE"; then
+        warn "Could not remove the temporary automount rule: $AUTOMOUNT_RULE"
+        return 1
+    fi
+    AUTOMOUNT_RULE=""
+    AUTOMOUNT_DISK=""
+    sudo udevadm control --reload-rules
+    if [[ "${1:-}" == refresh && -d "/sys/class/block/$disk" ]]; then
+        while IFS= read -r name; do
+            [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+            sudo udevadm trigger --action=change "/sys/class/block/$name" || true
+        done < <(lsblk -lnro KNAME "/dev/$disk" 2>/dev/null || true)
+        sudo udevadm settle || true
+    fi
+}
+ensure_sd_unmounted() {
+    local part
+    cleanup_mount
+    while IFS= read -r part; do
+        if findmnt -rn -S "$part" >/dev/null 2>&1; then
+            die "$part is still mounted. Close file-manager windows or disable desktop automount, then try again."
+        fi
+    done < <(lsblk -lnpo NAME "$SD_DEV")
+}
 format_sd() {
     info "Formatting the SD card as one MBR/FAT32 partition..."
-    cleanup_mount
-    sudo umount "${SD_DEV}"?* >/dev/null 2>&1 || true
+    suppress_sd_automount
+    ensure_sd_unmounted
     sudo wipefs -a "$SD_DEV" >/dev/null
     printf 'label: dos\n, , c, *\n' | sudo sfdisk "$SD_DEV" >/dev/null
     sudo partprobe "$SD_DEV" 2>/dev/null || true
     sudo udevadm settle 2>/dev/null || sleep 2
     SD_PART="$(partition_path "$SD_DEV")"
     [[ -b "$SD_PART" ]] || { sleep 2; [[ -b "$SD_PART" ]] || die "Partition $SD_PART did not appear."; }
+    ensure_sd_unmounted
     sudo mkfs.vfat -F 32 -n "$SD_LABEL" "$SD_PART" >/dev/null
     mount_sd
     ok "SD card formatted."
 }
 mount_sd() {
-    cleanup_mount
     mkdir -p "$MOUNT_DIR"
     if [[ -z "${SD_PART:-}" || ! -b "${SD_PART:-/nonexistent}" ]]; then
         SD_PART="$(lsblk -rpno NAME,LABEL,TYPE | awk -v l="$SD_LABEL" '$2==l && $3=="part" {print $1; exit}')"
     fi
     [[ -n "${SD_PART:-}" && -b "$SD_PART" ]] || die "Could not find the $SD_LABEL SD partition."
+    local parent
+    parent="$(lsblk -dnro PKNAME "$SD_PART")"
+    [[ "$parent" =~ ^[A-Za-z0-9._-]+$ ]] || die "Could not identify the SD card's parent device."
+    SD_DEV="/dev/$parent"
+    suppress_sd_automount
+    ensure_sd_unmounted
     sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=022 "$SD_PART" "$MOUNT_DIR"
 }
 wait_for_sd_return() {
     say ""
     while true; do
         say "Put the prepared SD card back into this computer."
-        say "If it appears in your file manager, open/mount it once."
+        say "The wizard will mount it; close any file-manager window using it."
         pause
         for _ in {1..10}; do
             SD_PART="$(lsblk -rpno NAME,LABEL,TYPE | awk -v l="$SD_LABEL" '$2==l && $3=="part" {print $1; exit}')"
@@ -584,6 +756,7 @@ EOF_WIFI
 
     cp "$SELF_DIR/camera/decloud_stage1.sh" "$MOUNT_DIR/custom/scripts/decloud_stage1.sh"
     cp "$SELF_DIR/camera/decloud_flash.sh" "$MOUNT_DIR/custom/scripts/decloud_flash.sh"
+    sed -i "s/MODEL=3215672.2/MODEL=$CAMERA_MODEL/" "$MOUNT_DIR/custom/scripts/decloud_stage1.sh"
     chmod +x "$MOUNT_DIR/custom/scripts/decloud_stage1.sh" "$MOUNT_DIR/custom/scripts/decloud_flash.sh"
     # Make entrypoint idempotent: stock firmware may call it as well as our direct hook.
     if ! grep -q 'DECLOUD_ENTRYPOINT_LOCK' "$MOUNT_DIR/custom/scripts/entrypoint.sh"; then
@@ -960,6 +1133,7 @@ PY_NIGHT
 
 build_firmware() {
     info "Building the cloud-free RTSP firmware from YOUR camera backup..."
+    info "The first Zig build can take several minutes on older computers; later builds can reuse its compiler cache."
     local backup_path akdir smol app_extract outdir
     backup_path="$(cat "$LATEST_BACKUP_FILE")"
     akdir="$SRC_DIR/firmware/src/ak_rtsp"
@@ -1124,6 +1298,9 @@ final_boot() {
     say "RTSP URL: ${BOLD}rtsp://${CAMERA_IP}:554/${RESET}"
     say "Alternative path: rtsp://${CAMERA_IP}:554/main_ch"
     say ""
+    say "Live settings: day/night, exposure and image adjustments are available on TCP port 8091."
+    say "See 'Live camera settings' in the GitHub README for commands; no reflash is needed."
+    say ""
     say "Recommended next steps:"
     say "  • Create a DHCP reservation for the camera in your router."
     say "  • Put the camera in an isolated camera/IoT VLAN if you use one."
@@ -1132,6 +1309,11 @@ final_boot() {
     say "  • Keep the backup stored at: $(cat "$LATEST_BACKUP_FILE")"
 }
 main() {
+    (( EUID != 0 )) || die "Run ./install.sh without sudo. The wizard asks for sudo only for packages and SD-card operations."
+    mkdir -p "$WORK_DIR" "$SRC_DIR" "$BACKUP_DIR" "$BUILD_DIR" "$MOUNT_DIR" "$RUNTIME_DIR"
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     banner
 
     section 1 8 "Camera identification"
@@ -1181,7 +1363,9 @@ Run without arguments to start the interactive installer.
 Options:
   -h, --help       Show this help
   -V, --version    Show version
-Supported camera: Action LSC Smart Connect 3215672.2 / SI B26101 only.
+Supported labels: 3215672.2 / SI B26101 or C26101; 3215672.3 / SI D26228.
+C26101 and D26228 are community-reported. The exact MTD layout is required.
+Run the interactive installer without sudo.
 EOF_HELP
         exit 0
         ;;
