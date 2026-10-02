@@ -27,7 +27,7 @@ That is all you need to download manually. The wizard downloads its helper files
 - Recognises the two additional camera labels reported in [issue #2](https://github.com/4ddict/Action-Smart-Connect-Flasher/issues/2), while retaining the exact MTD layout and backup checks.
 - Downloads an official, SHA-256-verified Zig compiler when Zig is missing, including on Debian/Q4OS.
 - Temporarily suppresses desktop automount for the selected SD card when udev/UDisks is available, and checks that it is unmounted before formatting.
-- Documents the firmware's existing local camera controls below. No settings choice is added to the installation wizard.
+- Documents the firmware's existing local camera controls below.
 
 Version 0.3.1 already fixed detection of tools in `/sbin` and the separate Debian `fdisk` package. The complete wizard now refuses to run as root; start it as your regular user.
 
@@ -69,7 +69,7 @@ The wizard checks the available tools before choosing `pacman`, APT or `dnf`. If
 
 If Zig remains unavailable, the wizard can download **Zig 0.14.1 directly from ziglang.org** into its own cache after you approve dependency installation. It verifies the published SHA-256 checksum before extracting or running it. No additional APT repository is needed.
 
-Automatic Zig downloads are configured for Linux x86 (32-bit), x86_64, AArch64, ARMv7 and RISC-V 64-bit hosts. The compiler cache is reused on later runs.
+Automatic Zig downloads are configured for Linux x86 (32-bit), x86_64, AArch64, ARMv7 and RISC-V 64-bit hosts.
 
 ---
 
