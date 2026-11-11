@@ -15,7 +15,7 @@
 Run this on your Linux computer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NiederreiterQE//Action-Smart-Connect-Flasher/main/install.sh -o /tmp/action-smart-connect-flasher.sh && bash /tmp/action-smart-connect-flasher.sh
+curl -fsSL https://raw.githubusercontent.com/4ddict/Action-Smart-Connect-Flasher/main/install.sh -o /tmp/action-smart-connect-flasher.sh && bash /tmp/action-smart-connect-flasher.sh
 ```
 
 That is all you need to download manually. The wizard downloads its helper files and the required upstream projects automatically.
