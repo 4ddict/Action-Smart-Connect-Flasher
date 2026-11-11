@@ -530,10 +530,13 @@ collect_sd_candidates() {
 describe_disk() {
     local d="$1" size model mounts
     size="$(lsblk -dnro SIZE "$d" | xargs)"
-    model="$(lsblk -dnro MODEL "$d" | xargs || true)"
+    model="$(lsblk -dno MODEL "$d" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
     mounts="$(lsblk -nrpo MOUNTPOINTS "$d" 2>/dev/null | awk 'NF' | paste -sd ', ' -)"
     printf '%s — %s' "$size" "${model:-removable storage}"
-    [[ -n "$mounts" ]] && printf ' — mounted at %s' "$mounts"
+    if [[ -n "$mounts" ]]; then
+        printf ' — mounted at %s' "$mounts"
+    fi
+    return 0
 }
 choose_sd_device() {
     say ""
