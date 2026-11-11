@@ -1155,7 +1155,7 @@ build_firmware() {
     file "$akdir/flash_tool" | grep -q 'ARM' || die "flash_tool is not an ARM executable."
     file "$akdir/flash_tool" | grep -q 'statically linked' || die "flash_tool is not statically linked."
     rm -rf "$app_extract" "$outdir"
-    mkdir -p "$app_extract" "$outdir"
+    mkdir -p "$outdir" #removed "$app_extract" since unsquashfs doesn't override existing dirs
     unsquashfs -d "$app_extract" "$backup_path/mtdblock7.bin" >/dev/null \
         || die "Could not unpack the stock APP partition."
 
