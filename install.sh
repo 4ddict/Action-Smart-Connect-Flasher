@@ -530,10 +530,13 @@ collect_sd_candidates() {
 describe_disk() {
     local d="$1" size model mounts
     size="$(lsblk -dnro SIZE "$d" | xargs)"
-    model="$(lsblk -dnro MODEL "$d" | xargs || true)"
+    model="$(lsblk -dno MODEL "$d" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
     mounts="$(lsblk -nrpo MOUNTPOINTS "$d" 2>/dev/null | awk 'NF' | paste -sd ', ' -)"
     printf '%s — %s' "$size" "${model:-removable storage}"
-    [[ -n "$mounts" ]] && printf ' — mounted at %s' "$mounts"
+    if [[ -n "$mounts" ]]; then
+        printf ' — mounted at %s' "$mounts"
+    fi
+    return 0
 }
 choose_sd_device() {
     say ""
@@ -1155,7 +1158,7 @@ build_firmware() {
     file "$akdir/flash_tool" | grep -q 'ARM' || die "flash_tool is not an ARM executable."
     file "$akdir/flash_tool" | grep -q 'statically linked' || die "flash_tool is not statically linked."
     rm -rf "$app_extract" "$outdir"
-    mkdir -p "$app_extract" "$outdir"
+    mkdir -p "$outdir" #removed "$app_extract" since unsquashfs doesn't override existing dirs
     unsquashfs -d "$app_extract" "$backup_path/mtdblock7.bin" >/dev/null \
         || die "Could not unpack the stock APP partition."
 
